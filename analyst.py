@@ -1,7 +1,6 @@
 import os
 import asyncio
-import httpx
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 from typing import List
 from openai import OpenAI
@@ -25,7 +24,7 @@ SYSTEM_PROMPT = (
 
 async def build_prompt(questions: str, files: List[UploadFile]) -> str:
     """
-    Build the user prompt from the question file and optional file contents.
+    Build the user prompt from the questions file and optional file contents.
     Compress file contents if large.
     """
     prompt_parts = [questions.strip()]
@@ -37,7 +36,9 @@ async def build_prompt(questions: str, files: List[UploadFile]) -> str:
                     content = content[:2000] + "...[truncated]"
                 prompt_parts.append(f"\n\n--- File: {file.filename} ---\n{content}")
             except Exception as e:
-                prompt_parts.append(f"\n\n--- File: {file.filename} ---\n[Error reading file: {e}]")
+                prompt_parts.append(
+                    f"\n\n--- File: {file.filename} ---\n[Error reading file: {e}]"
+                )
     return "\n".join(prompt_parts)
 
 async def call_openai_with_retry(system_prompt: str, user_prompt: str, retries: int = 4, timeout: int = 300):
@@ -60,31 +61,40 @@ async def call_openai_with_retry(system_prompt: str, user_prompt: str, retries: 
                 return f"[]  # Failed after {retries} retries: {e}"
             await asyncio.sleep(1)  # brief wait before retry
 
-@app.post("/analyze")
+@app.get("/")
+async def root():
+    """
+    Root endpoint to check if the server is running.
+    """
+    return {"message": "Data Analyst Agent API is running. Use POST /api to analyze data."}
+
+@app.post("/api")
 async def analyze(
-    questions: UploadFile = File(...),
-    files: List[UploadFile] = File(default=[])
+    questions_file: UploadFile = File(..., alias="questions.txt"),
+    extra_files: List[UploadFile] = File(default=[])
 ):
     """
     Main API endpoint for analysis.
+    Accepts:
+      - Required: questions.txt file
+      - Optional: Any number of additional files (csv, images, pdf, etc.)
     """
     try:
         # Read questions.txt content
-        questions_text = (await questions.read()).decode("utf-8", errors="ignore")
+        questions_text = (await questions_file.read()).decode("utf-8", errors="ignore")
 
         # Build the full user prompt
-        user_prompt = await build_prompt(questions_text, files)
+        user_prompt = await build_prompt(questions_text, extra_files)
 
         # Call OpenAI API with retries and timeout
         result_text = await call_openai_with_retry(SYSTEM_PROMPT, user_prompt)
 
-        # Ensure valid JSON is returned (even if incorrect answers)
+        # Ensure valid JSON
         try:
             import json
             parsed = json.loads(result_text)
             return JSONResponse(content=parsed)
         except Exception:
-            # If model output is not valid JSON, wrap it
             return JSONResponse(content=[result_text])
 
     except Exception as e:
@@ -92,4 +102,4 @@ async def analyze(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, port=8000)
