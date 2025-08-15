@@ -1,14 +1,16 @@
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+from typing import List, Dict, Any
 import os
 import asyncio
-from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import JSONResponse
-from typing import List
+import base64
 from openai import OpenAI
+import json
 
 # Initialize FastAPI
 app = FastAPI()
 
-# Get API key
+# Environment variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
 if not OPENAI_API_KEY or not OPENAI_BASE_URL:
@@ -17,90 +19,121 @@ if not OPENAI_API_KEY or not OPENAI_BASE_URL:
 # Initialize OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 
-SYSTEM_PROMPT = (
-    "You are a data analyst agent. You will receive questions and optionally files. "
-    "You will write Python code in your head, run it mentally, and give the results "
-    "in JSON exactly as requested."
-)
+SYSTEM_PROMPT = """
+You are a data analysis assistant. Analyze the provided data and questions.
+Return ONLY a JSON object containing the answers. 
+Do not include any markdown formatting or code blocks.
+If you cannot solve a problem, return a JSON object with an 'error' key explaining why.
+"""
 
-async def build_prompt(questions: str, files: List[UploadFile]) -> str:
-    """
-    Build the user prompt from the questions file and optional file contents.
-    Compress file contents if large.
-    """
-    prompt_parts = [questions.strip()]
-    if files:
-        for file in files:
-            try:
-                content = (await file.read()).decode("utf-8", errors="ignore")
-                if len(content) > 2000:
-                    content = content[:2000] + "...[truncated]"
-                prompt_parts.append(f"\n\n--- File: {file.filename} ---\n{content}")
-            except Exception as e:
-                prompt_parts.append(
-                    f"\n\n--- File: {file.filename} ---\n[Error reading file: {e}]"
-                )
+async def read_file_content(file: UploadFile) -> Dict[str, Any]:
+    """Read and process file content based on file type"""
+    content = await file.read()
+    await file.seek(0)  # Reset file pointer
+    
+    try:
+        if file.filename.endswith(('.txt', '.csv')):
+            return {
+                'type': 'text',
+                'content': content.decode('utf-8'),
+                'filename': file.filename
+            }
+        elif file.filename.endswith(('.png', '.jpg', '.jpeg')):
+            return {
+                'type': 'image',
+                'content': base64.b64encode(content).decode('utf-8'),
+                'filename': file.filename
+            }
+        else:
+            return {
+                'type': 'unknown',
+                'content': None,
+                'filename': file.filename
+            }
+    except Exception as e:
+        return {
+            'type': 'error',
+            'content': str(e),
+            'filename': file.filename
+        }
+
+async def build_prompt(questions: str, files: List[Dict[str, Any]]) -> str:
+    """Build structured prompt from questions and files"""
+    prompt_parts = [f"Questions:\n{questions.strip()}"]
+    
+    for file in files:
+        if file['type'] == 'text':
+            prompt_parts.append(f"\nContents of {file['filename']}:\n{file['content']}")
+        elif file['type'] == 'image':
+            prompt_parts.append(f"\nImage file included: {file['filename']} (base64 encoded)")
+        else:
+            prompt_parts.append(f"\nFile included: {file['filename']} (unprocessed)")
+    
     return "\n".join(prompt_parts)
 
-async def call_openai_with_retry(system_prompt: str, user_prompt: str, retries: int = 4, timeout: int = 300):
-    """
-    Call OpenAI API with retry and timeout.
-    """
-    for attempt in range(1, retries + 1):
+async def call_openai_with_retry(prompt: str, max_retries: int = 3) -> str:
+    """Call OpenAI API with retry logic"""
+    for attempt in range(max_retries):
         try:
-            async with asyncio.timeout(timeout):
-                response = client.responses.create(
-                    model="gpt-4.1",
-                    input=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
+            async with asyncio.timeout(180):  # 3 minute timeout
+                response = await client.chat.completions.create(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt}
                     ]
                 )
-                return response.output_text
+                return response.choices[0].message.content
+        except asyncio.TimeoutError:
+            if attempt == max_retries - 1:
+                raise HTTPException(status_code=504, detail="Request timeout")
+            await asyncio.sleep(2 ** attempt)  # Exponential backoff
         except Exception as e:
-            if attempt == retries:
-                return f"[]  # Failed after {retries} retries: {e}"
-            await asyncio.sleep(1)  # brief wait before retry
-
-@app.get("/")
-async def root():
-    """
-    Root endpoint to check if the server is running.
-    """
-    return {"message": "Data Analyst Agent API is running. Use POST /api to analyze data."}
+            if attempt == max_retries - 1:
+                raise HTTPException(status_code=500, detail=str(e))
+            await asyncio.sleep(2 ** attempt)
 
 @app.post("/api")
 async def analyze(
     questions_file: UploadFile = File(..., alias="questions.txt"),
     extra_files: List[UploadFile] = File(default=[])
 ):
-    """
-    Main API endpoint for analysis.
-    Accepts:
-      - Required: questions.txt file
-      - Optional: Any number of additional files (csv, images, pdf, etc.)
-    """
+    """Process analysis request and return JSON response"""
     try:
-        # Read questions.txt content
-        questions_text = (await questions_file.read()).decode("utf-8", errors="ignore")
-
-        # Build the full user prompt
-        user_prompt = await build_prompt(questions_text, extra_files)
-
-        # Call OpenAI API with retries and timeout
-        result_text = await call_openai_with_retry(SYSTEM_PROMPT, user_prompt)
-
-        # Ensure valid JSON
+        # Read questions
+        questions = (await questions_file.read()).decode('utf-8')
+        
+        # Process all files
+        file_contents = [
+            await read_file_content(f) for f in extra_files
+        ]
+        
+        # Build prompt
+        prompt = await build_prompt(questions, file_contents)
+        
+        # Get OpenAI response
+        response_text = await call_openai_with_retry(prompt)
+        
         try:
-            import json
-            parsed = json.loads(result_text)
-            return JSONResponse(content=parsed)
-        except Exception:
-            return JSONResponse(content=[result_text])
-
+            # Parse response as JSON
+            result = json.loads(response_text)
+            return result  # FastAPI will automatically convert dict to JSON
+        except json.JSONDecodeError:
+            # If response isn't valid JSON, return error
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": "Invalid JSON response from AI model",
+                    "raw_response": response_text
+                }
+            )
+            
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        return JSONResponse(content=[f"Error: {e}"])
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
