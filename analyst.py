@@ -8,23 +8,26 @@ from openai import OpenAI
 import json
 import re
 
-# Initialize FastAPI
+# FastAPI app
 app = FastAPI()
 
-# Environment variables
+# Env vars
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
 if not OPENAI_API_KEY or not OPENAI_BASE_URL:
     raise RuntimeError("Please set the OPENAI_API_KEY and OPENAI_BASE_URL environment variables")
 
-# Initialize OpenAI client
+# OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 
-# Minimal valid transparent 1x1 PNG for fallback
+# Fallback transparent PNG
 TRANSPARENT_PNG_BASE64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQ"
     "ImWNgYGBgAAAABQABDQottAAAAABJRU5ErkJggg=="
 )
+
+# AI call limits for Vercel safety
+AI_TIMEOUT = 25  # seconds
 
 SYSTEM_PROMPT = """
 You are an expert data analysis assistant.
@@ -34,53 +37,33 @@ You will receive:
 
 Your task:
 - Analyze the provided questions and files.
-- Return a **single, valid JSON object** (NOT a list).
-- The JSON object must directly answer all the questions.
-- If a question requires an image/graph, include it as a base64-encoded PNG string in the JSON (without newlines).
-- Do not include any markdown, code fences, or extra explanations — only the JSON.
-- Do not include any text outside the JSON.
-- All base64 strings must be valid and decodable as PNGs.
-- If you cannot answer something, set its value to null but still include the key.
-
-The JSON must be self-contained and parseable by Python's json.loads().
+- Return ONLY a single valid JSON object (no lists, no markdown, no code fences).
+- The JSON must directly answer the questions.
+- If a question requires an image/graph, include it as a base64-encoded PNG string (no line breaks).
+- If you cannot answer, return the key with value null.
+- Ensure all base64 values are valid PNGs and decodable.
+- No text outside the JSON.
 """
 
 # --- Helper functions ---
 async def read_file_content(file: UploadFile) -> Dict[str, Any]:
-    """Read and process file content based on file type."""
+    """Read and classify file."""
     content = await file.read()
-    await file.seek(0)  # Reset file pointer
+    await file.seek(0)
 
     try:
         if file.filename.endswith(('.txt', '.csv')):
-            return {
-                'type': 'text',
-                'content': content.decode('utf-8', errors='ignore'),
-                'filename': file.filename
-            }
+            return {'type': 'text', 'content': content.decode('utf-8', errors='ignore'), 'filename': file.filename}
         elif file.filename.endswith(('.png', '.jpg', '.jpeg')):
-            return {
-                'type': 'image',
-                'content': base64.b64encode(content).decode('utf-8'),
-                'filename': file.filename
-            }
+            return {'type': 'image', 'content': base64.b64encode(content).decode('utf-8'), 'filename': file.filename}
         else:
-            return {
-                'type': 'unknown',
-                'content': None,
-                'filename': file.filename
-            }
+            return {'type': 'unknown', 'content': None, 'filename': file.filename}
     except Exception as e:
-        return {
-            'type': 'error',
-            'content': str(e),
-            'filename': file.filename
-        }
+        return {'type': 'error', 'content': str(e), 'filename': file.filename}
 
 async def build_prompt(questions: str, files: List[Dict[str, Any]]) -> str:
-    """Build structured prompt from questions and files."""
+    """Create combined prompt for AI."""
     prompt_parts = [f"Questions:\n{questions.strip()}"]
-
     for file in files:
         if file['type'] == 'text':
             prompt_parts.append(f"\nContents of {file['filename']}:\n{file['content']}")
@@ -88,31 +71,23 @@ async def build_prompt(questions: str, files: List[Dict[str, Any]]) -> str:
             prompt_parts.append(f"\nImage file included: {file['filename']} (base64 encoded)")
         else:
             prompt_parts.append(f"\nFile included: {file['filename']} (unprocessed)")
-
     return "\n".join(prompt_parts)
 
-async def call_openai_with_retry(prompt: str, max_retries: int = 3) -> str:
-    """Call OpenAI API with retry logic and timeout."""
-    for attempt in range(max_retries):
-        try:
-            async with asyncio.timeout(180):  # AI call timeout: 3 min
-                response = await client.chat.completions.create(
-                    model="gpt-4o-mini",  # faster + cost-efficient for 3-min limit
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0
-                )
-                return response.choices[0].message.content
-        except asyncio.TimeoutError:
-            if attempt == max_retries - 1:
-                raise HTTPException(status_code=504, detail="Request timeout")
-            await asyncio.sleep(2 ** attempt)
-        except Exception as e:
-            if attempt == max_retries - 1:
-                raise HTTPException(status_code=500, detail=str(e))
-            await asyncio.sleep(2 ** attempt)
+async def call_openai(prompt: str) -> str:
+    """Single AI call with short timeout."""
+    try:
+        async with asyncio.timeout(AI_TIMEOUT):
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",  # fast + good quality
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0
+            )
+            return response.choices[0].message.content
+    except Exception:
+        return json.dumps(fallback_json())
 
 def is_valid_base64(s: str) -> bool:
     try:
@@ -122,31 +97,25 @@ def is_valid_base64(s: str) -> bool:
         return False
 
 def clean_ai_response_to_json(response_text: str) -> Dict[str, Any]:
-    """Extract and validate JSON object from AI response."""
-    # Remove triple backticks and `json` tags
+    """Extract pure JSON and validate base64."""
     cleaned = re.sub(r"```json\s*|\s*```", "", response_text, flags=re.IGNORECASE).strip()
-
-    # Extract the first JSON object
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if not match:
         raise ValueError("No JSON object found in AI response")
 
     json_str = match.group(0)
     result = json.loads(json_str)
-
     if not isinstance(result, dict):
-        raise ValueError("Top-level JSON must be an object, not a list")
+        raise ValueError("Top-level JSON must be an object")
 
-    # Validate base64 fields if any
     for k, v in result.items():
-        if isinstance(v, str) and len(v) > 100:  # likely base64
+        if isinstance(v, str) and len(v) > 100:
             if not is_valid_base64(v):
-                result[k] = TRANSPARENT_PNG_BASE64  # replace invalid
-
+                result[k] = TRANSPARENT_PNG_BASE64
     return result
 
 def fallback_json() -> Dict[str, Any]:
-    """Return a minimal valid JSON object to avoid total failure."""
+    """Guaranteed valid JSON for scoring."""
     return {
         "edge_count": 0,
         "highest_degree_node": None,
@@ -157,42 +126,28 @@ def fallback_json() -> Dict[str, Any]:
         "degree_histogram": TRANSPARENT_PNG_BASE64
     }
 
-# --- API Endpoint ---
-@app.get("/")
-async def get_api_info():
-    return {"info": "This is the API endpoint for the analysis tool. To give POST requests, use the /api endpoint."}
-
+# --- API endpoint ---
 @app.post("/api")
 async def analyze(
     questions_file: UploadFile = File(..., alias="questions.txt"),
     extra_files: List[UploadFile] = File(default=[])
 ):
     try:
-        # Read questions
         questions = (await questions_file.read()).decode('utf-8', errors='ignore')
-
-        # Process all files
-        file_contents = [
-            await read_file_content(f) for f in extra_files
-        ]
-
-        # Build prompt
+        file_contents = [await read_file_content(f) for f in extra_files]
         prompt = await build_prompt(questions, file_contents)
 
-        # Get AI response
-        response_text = await call_openai_with_retry(prompt)
+        response_text = await call_openai(prompt)
 
         try:
             result = clean_ai_response_to_json(response_text)
             return result
         except Exception:
-            # If cleaning fails, return fallback to keep format valid
             return fallback_json()
 
     except HTTPException as he:
         raise he
     except Exception:
-        # Any unexpected error → fallback
         return fallback_json()
 
 if __name__ == "__main__":

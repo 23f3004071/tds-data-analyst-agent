@@ -2,7 +2,7 @@ import requests
 import os
 
 # Change this if running on a server or different port
-BASE_URL = "https://tds-data-analyst-agent-murex.vercel.app/api"
+BASE_URL = "https://tds-data-analyst-agent-bay.vercel.app/api"
 
 # Required file
 files = [
