@@ -158,6 +158,10 @@ def fallback_json() -> Dict[str, Any]:
     }
 
 # --- API Endpoint ---
+@app.get("/")
+async def get_api_info():
+    return {"info": "This is the API endpoint for the analysis tool. To give POST requests, use the /api endpoint."}
+
 @app.post("/api")
 async def analyze(
     questions_file: UploadFile = File(..., alias="questions.txt"),
