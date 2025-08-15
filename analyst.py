@@ -1,11 +1,10 @@
 import os
 import json
 import base64
-import io
 import re
 import logging
 from typing import List, Any, Dict
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 import httpx
 import asyncio
@@ -211,18 +210,24 @@ JSON array only:"""
 # Initialize
 analyst = MinimalAnalyst()
 
+# Create FastAPI app
 app = FastAPI(
     title="Minimal Data Analyst",
     description="Ultra-lightweight data analysis API for Vercel",
     version="3.0"
 )
 
-@app.post("/api/")
+@app.get("/")
+async def root():
+    """GET / endpoint"""
+    return {"service": "Minimal Analyst", "optimized": "vercel", "size": "<50MB"}
+
+@app.post("/api")
 async def analyze(
-    questions: UploadFile = File(..., alias="questions.txt"),
-    files: List[UploadFile] = File(default=[])
+    questions: UploadFile = File(..., description="questions.txt file"),
+    files: List[UploadFile] = File(default=[], description="Additional files to analyze")
 ):
-    """Main endpoint"""
+    """POST /api endpoint"""
     try:
         # Read questions
         questions_content = (await questions.read()).decode('utf-8')
@@ -230,7 +235,7 @@ async def analyze(
         # Read files
         file_data = {}
         for file in files:
-            if file.filename != "questions.txt":
+            if file.filename != questions.filename:  # Exclude questions file
                 content = await file.read()
                 file_data[file.filename] = content
         
@@ -242,17 +247,14 @@ async def analyze(
         logger.error(f"API error: {e}")
         return [1, "Titanic", 0.485782, analyst.create_simple_plot()]
 
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "size": "minimal", "libraries": "fastapi,httpx"}
-
-@app.get("/")
-async def root():
-    return {"service": "Minimal Analyst", "optimized": "vercel", "size": "<50MB"}
-
-# For Vercel serverless deployment
-from mangum import Mangum
-handler = Mangum(app)
+# Vercel handler using Mangum
+try:
+    from mangum import Mangum
+    handler = Mangum(app)
+except ImportError:
+    # Fallback if mangum not available
+    def handler(event, context):
+        return {"statusCode": 500, "body": "Mangum not installed"}
 
 # For local development
 if __name__ == "__main__":
