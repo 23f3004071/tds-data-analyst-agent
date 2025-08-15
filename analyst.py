@@ -5,7 +5,7 @@ import io
 import re
 import logging
 from typing import List, Any, Dict
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse
 import httpx
 import asyncio
@@ -250,12 +250,11 @@ async def health():
 async def root():
     return {"service": "Minimal Analyst", "optimized": "vercel", "size": "<50MB"}
 
-# Vercel serverless function export
-def handler(request):
-    """Vercel handler function"""
-    import uvicorn
-    return uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+# For Vercel serverless deployment
+from mangum import Mangum
+handler = Mangum(app)
 
+# For local development
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
