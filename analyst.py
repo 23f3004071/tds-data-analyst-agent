@@ -10,11 +10,12 @@ app = FastAPI()
 
 # Get API key
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Please set the OPENAI_API_KEY environment variable")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
+if not OPENAI_API_KEY or not OPENAI_BASE_URL:
+    raise RuntimeError("Please set the OPENAI_API_KEY and OPENAI_BASE_URL environment variables")
 
 # Initialize OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY, base_url=os.getenv("OPENAI_BASE_URL"))
+client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 
 SYSTEM_PROMPT = (
     "You are a data analyst agent. You will receive questions and optionally files. "
