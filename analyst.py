@@ -74,20 +74,23 @@ async def build_prompt(questions: str, files: List[Dict[str, Any]]) -> str:
     return "\n".join(prompt_parts)
 
 async def call_openai(prompt: str) -> str:
-    """Single AI call with short timeout."""
     try:
         async with asyncio.timeout(AI_TIMEOUT):
             response = await client.chat.completions.create(
-                model="gpt-4o-mini",  # fast + good quality
+                model="gpt-4o-mini",  # faster
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0
+                temperature=0,
+                timeout=AI_TIMEOUT,  # ensure httpx layer also times out
+                max_retries=0         # DISABLE OpenAI automatic retries
             )
             return response.choices[0].message.content
-    except Exception:
+    except Exception as e:
+        print(f"AI call failed quickly: {e}")  # log in Vercel
         return json.dumps(fallback_json())
+
 
 def is_valid_base64(s: str) -> bool:
     try:
