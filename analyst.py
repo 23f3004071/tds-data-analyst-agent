@@ -1,5 +1,5 @@
 from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from typing import List, Dict, Any
 import os
 import asyncio
@@ -7,86 +7,88 @@ import base64
 import json
 import pandas as pd
 import pdfplumber
-import pytesseract
-from PIL import Image
 from io import BytesIO
-from openai import OpenAI
+from openai import AsyncOpenAI
 import re
 
+# FastAPI app
 app = FastAPI()
 
+# Env vars
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
 if not OPENAI_API_KEY or not OPENAI_BASE_URL:
     raise RuntimeError("Missing OPENAI_API_KEY or OPENAI_BASE_URL")
 
-client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 
-AI_TIMEOUT = 20
+# Config
+AI_TIMEOUT = 20  # seconds for each AI call
+AI_MAX_RETRIES = 2  # number of extra retries
 SYSTEM_PROMPT = """
-You are a versatile data analysis assistant. 
-You will be given:
+You are a versatile data analysis assistant.
+You will receive:
 1. Questions in plain text
-2. Summarized descriptions of provided data files
+2. Short summaries of provided data files
 
 Rules:
-- Answer every question directly in JSON format
-- If data is insufficient, set the value to null
-- Do not output explanations or extra text, only the JSON object
-- Ensure JSON is valid and parseable
+- Return answers ONLY as a valid JSON object
+- Keys should be short descriptions of each question
+- Values should be the direct answer or null if data is insufficient
+- No explanations, markdown, or extra text outside JSON
+- If a calculation is required, compute it logically
 """
 
+@app.get("/")
+async def home():
+    return PlainTextResponse("Welcome to the Data Analysis API. Use POST /api with 'questions.txt' and optional files.")
+
 def summarize_file(file_data: bytes, filename: str) -> str:
-    """Summarize file content without sending raw data to AI."""
+    """Summarize file contents for AI without sending raw big data."""
     try:
-        if filename.endswith(".csv"):
+        if filename.lower().endswith(".csv"):
             df = pd.read_csv(BytesIO(file_data))
-            summary = {
+            return json.dumps({
                 "filename": filename,
                 "columns": df.columns.tolist(),
-                "head": df.head(3).to_dict(),
-                "shape": df.shape
-            }
-            return json.dumps(summary)
-        elif filename.endswith(".pdf"):
+                "shape": df.shape,
+                "sample_rows": df.head(3).to_dict()
+            })
+        elif filename.lower().endswith(".pdf"):
             with pdfplumber.open(BytesIO(file_data)) as pdf:
-                text = "\n".join(page.extract_text() or "" for page in pdf.pages[:2])
-            return f"{filename} (first 2 pages text): {text[:1000]}"
-        elif filename.lower().endswith((".png", ".jpg", ".jpeg")):
-            img = Image.open(BytesIO(file_data))
-            text = pytesseract.image_to_string(img)
-            return f"{filename} (OCR text): {text[:500]}"
+                text = "\n".join((page.extract_text() or "") for page in pdf.pages[:1])
+            return f"{filename} (first page text): {text[:800]}"
+        elif filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif")):
+            b64 = base64.b64encode(file_data).decode("utf-8")[:200]  # snippet
+            return f"{filename} (image base64 start): {b64}..."
         else:
             text = file_data.decode(errors="ignore")
-            return f"{filename} (text excerpt): {text[:1000]}"
+            return f"{filename} (text excerpt): {text[:800]}"
     except Exception as e:
         return f"{filename} could not be processed: {e}"
 
 async def call_openai(prompt: str) -> Dict[str, Any]:
-    try:
-        async with asyncio.timeout(AI_TIMEOUT):
-            resp = await client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0,
-                timeout=AI_TIMEOUT,
-                max_retries=0
-            )
-            text = resp.choices[0].message.content.strip()
-            text = re.sub(r"```json\s*|\s*```", "", text)
-            return json.loads(text)
-    except Exception as e:
-        print(f"AI failed: {e}")
-        return {}
-
-
-@app.get("/")
-async def root():
-    return {"message": "Welcome to the Data Analysis API. Give POST at /api for analysis."}
-
+    """Call AI with retries, strict timeout & safe JSON parse."""
+    for attempt in range(AI_MAX_RETRIES + 1):
+        try:
+            async with asyncio.timeout(AI_TIMEOUT):
+                resp = await client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0,
+                    timeout=AI_TIMEOUT,
+                    max_retries=0
+                )
+                text = resp.choices[0].message.content.strip()
+                text = re.sub(r"```json\s*|\s*```", "", text)  # strip markdown
+                return json.loads(text)
+        except Exception as e:
+            print(f"AI attempt {attempt+1} failed: {e}")
+            await asyncio.sleep(1)  # short delay before retry
+    return {}  # fallback if all retries fail
 
 @app.post("/api")
 async def analyze(
@@ -94,21 +96,22 @@ async def analyze(
     extra_files: List[UploadFile] = File(default=[])
 ):
     try:
-        # Read and summarize files
+        # Read questions
         questions_text = (await questions_file.read()).decode(errors="ignore")
+
+        # Summarize extra files
         file_summaries = []
         for f in extra_files:
             content = await f.read()
-            summary = summarize_file(content, f.filename)
-            file_summaries.append(summary)
+            file_summaries.append(summarize_file(content, f.filename))
 
-        # Build compact prompt
+        # Build AI prompt
         prompt = f"Questions:\n{questions_text.strip()}\n\nData summaries:\n" + "\n".join(file_summaries)
 
-        # Call AI
+        # Get AI answers
         ai_answers = await call_openai(prompt)
 
-        # Always return valid JSON
+        # Ensure valid JSON object
         if not isinstance(ai_answers, dict):
             ai_answers = {}
 
