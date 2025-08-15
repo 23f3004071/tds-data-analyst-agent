@@ -14,7 +14,7 @@ if not OPENAI_API_KEY:
     raise RuntimeError("Please set the OPENAI_API_KEY environment variable")
 
 # Initialize OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY, base_url=os.getenv("OPENAI_BASE_URL"))
 
 SYSTEM_PROMPT = (
     "You are a data analyst agent. You will receive questions and optionally files. "

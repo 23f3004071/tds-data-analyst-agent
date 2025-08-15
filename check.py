@@ -1,20 +1,19 @@
 import requests
+import os
 
 # Change this if running on a server or different port
-BASE_URL = "http://127.0.0.1:8000/api"
+BASE_URL = "https://tds-data-analyst-agent-murex.vercel.app/api"
 
 # Required file
 files = [
     ("questions.txt", ("questions.txt", open("questions.txt", "rb"), "text/plain")),
 ]
 
-# Optional extra files
-optional_files = [
-    ("extra_files", ("data.csv", open("data.csv", "rb"), "text/csv")),
-]
-
-# Merge required + optional
-files.extend(optional_files)
+# Add data.csv only if it exists
+if os.path.exists("data.csv"):
+    files.append(
+        ("extra_files", ("data.csv", open("data.csv", "rb"), "text/csv"))
+    )
 
 # Send POST request
 response = requests.post(BASE_URL, files=files)
