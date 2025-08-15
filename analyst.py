@@ -23,13 +23,14 @@ if not OPENAI_API_KEY or not OPENAI_BASE_URL:
 client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 
 # Config
+MAX_CONTENT_LENGTH = 15000  # Max characters per file to avoid huge prompts
 AI_TIMEOUT = 20  # seconds for each AI call
 AI_MAX_RETRIES = 2  # number of extra retries
 SYSTEM_PROMPT = """
 You are a versatile data analysis assistant.
 You will receive:
 1. Questions in plain text
-2. Short summaries of provided data files
+2. Content of provided data files (which may be truncated if large)
 
 Rules:
 - Return answers ONLY as a valid JSON object
@@ -43,27 +44,24 @@ Rules:
 async def home():
     return PlainTextResponse("Welcome to the Data Analysis API. Use POST /api with 'questions.txt' and optional files.")
 
-def summarize_file(file_data: bytes, filename: str) -> str:
-    """Summarize file contents for AI without sending raw big data."""
+def get_file_content(file_data: bytes, filename: str) -> str:
+    """Extracts content from file for AI, with truncation for very large files."""
+    content = ""
     try:
         if filename.lower().endswith(".csv"):
-            df = pd.read_csv(BytesIO(file_data))
-            return json.dumps({
-                "filename": filename,
-                "columns": df.columns.tolist(),
-                "shape": df.shape,
-                "sample_rows": df.head(3).to_dict()
-            })
+            content = file_data.decode(errors="ignore")
         elif filename.lower().endswith(".pdf"):
             with pdfplumber.open(BytesIO(file_data)) as pdf:
-                text = "\n".join((page.extract_text() or "") for page in pdf.pages[:1])
-            return f"{filename} (first page text): {text[:800]}"
+                content = "\n".join(page.extract_text() or "" for page in pdf.pages)
         elif filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif")):
-            b64 = base64.b64encode(file_data).decode("utf-8")[:200]  # snippet
-            return f"{filename} (image base64 start): {b64}..."
+            content = base64.b64encode(file_data).decode("utf-8")
         else:
-            text = file_data.decode(errors="ignore")
-            return f"{filename} (text excerpt): {text[:800]}"
+            content = file_data.decode(errors="ignore")
+
+        if len(content) > MAX_CONTENT_LENGTH:
+            content = content[:MAX_CONTENT_LENGTH] + "\n... [TRUNCATED] ..."
+
+        return f'File: {filename}\n"""\n{content}\n"""'
     except Exception as e:
         return f"{filename} could not be processed: {e}"
 
@@ -99,14 +97,14 @@ async def analyze(
         # Read questions
         questions_text = (await questions_file.read()).decode(errors="ignore")
 
-        # Summarize extra files
-        file_summaries = []
+        # Extract content from extra files
+        file_contents = []
         for f in extra_files:
             content = await f.read()
-            file_summaries.append(summarize_file(content, f.filename))
+            file_contents.append(get_file_content(content, f.filename))
 
         # Build AI prompt
-        prompt = f"Questions:\n{questions_text.strip()}\n\nData summaries:\n" + "\n".join(file_summaries)
+        prompt = f"Questions:\n{questions_text.strip()}\n\nFile Contents:\n" + "\n".join(file_contents)
 
         # Get AI answers
         ai_answers = await call_openai(prompt)
